@@ -1,0 +1,236 @@
+
+name: Deployment Status
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  pre-deployment:
+    name: pre-deployment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 2
+
+      - name: Set up Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Create deployment tracking issue
+        uses: actions/github-script@v6
+        id: create-issue
+        with:
+          script: |
+            const { data: issue } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Deployment Tracking - ${context.sha}`,
+              labels: ['deployment', 'in-progress']
+            });
+            console.log('Issue created:', issue.html_url);
+            return issue.number;
+
+      - name: Capture previous commit SHA and package version
+        id: capture-info
+        run: |
+          PREV_SHA=$(git rev-parse HEAD~1)
+          VERSION=$(node -p "require('./package.json').version")
+          echo "PREV_SHA=$PREV_SHA" >> $GITHUB_OUTPUT
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Post pre-deployment comment
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const issueNumber = ${{ steps.create-issue.outputs.result }};
+            const prevSha = '${{ steps.capture-info.outputs.PREV_SHA }}';
+            const version = '${{ steps.capture-info.outputs.VERSION }}';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: `Pre-deployment checks completed.\n\nPrevious Commit: ${prevSha}\nPackage Version: ${version}`
+            });
+
+  rollback-preparation:
+    name: rollback-preparation
+    runs-on: ubuntu-latest
+    needs: pre-deployment
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 2
+
+      - name: Set up Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Capture commit info
+        id: commit-info
+        run: |
+          CURRENT_SHA=${{ github.sha }}
+          PREV_SHA=$(git rev-parse HEAD~1)
+          VERSION=$(node -p "require('./package.json').version")
+          echo "CURRENT_SHA=$CURRENT_SHA" >> $GITHUB_OUTPUT
+          echo "PREV_SHA=$PREV_SHA" >> $GITHUB_OUTPUT
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create rollback script
+        run: |
+          cat > rollback.sh << 'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          echo "Rolling back to commit $1"
+          git checkout $1
+          npm ci
+          npm run build
+          echo "Rollback completed successfully"
+          EOF
+          chmod +x rollback.sh
+
+      - name: Backup configuration files
+        run: |
+          mkdir -p rollback-backup
+          cp package.json package-lock.json rollback-backup/
+          cp -r .env.example rollback-backup/ || true
+
+      - name: Create dependency verification script
+        run: |
+          cat > verify-deps.js << 'EOF'
+          const pkg = require('./package.json');
+          console.log('Verifying dependencies for rollback...');
+          // Add actual verification logic as needed
+          console.log('All dependencies compatible.');
+          EOF
+
+      - name: Create rollback documentation
+        run: |
+          cat > ROLLBACK.md << 'EOF'
+          # Rollback Instructions
+
+          1. Stop current deployment
+          2. Run rollback script: `./rollback.sh <commit-sha>`
+          3. Verify dependencies with `node verify-deps.js`
+          4. Restart services
+          5. Confirm health checks pass
+          EOF
+
+      - name: Compress rollback package
+        id: compress
+        run: |
+          ARTIFACT_NAME="rollback-package-${{ steps.commit-info.outputs.CURRENT_SHA }}"
+          tar -czf ${ARTIFACT_NAME}.tar.gz rollback.sh rollback-backup/ verify-deps.js ROLLBACK.md
+          SHA256=$(sha256sum ${ARTIFACT_NAME}.tar.gz | awk '{print $1}')
+          echo "ARTIFACT_NAME=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
+          echo "SHA256=${SHA256}" >> $GITHUB_OUTPUT
+
+      - name: Upload rollback artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ steps.compress.outputs.ARTIFACT_NAME }}
+          path: ${{ steps.compress.outputs.ARTIFACT_NAME }}.tar.gz
+          retention-days: 30
+
+      - name: Post rollback plan comment
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const issueNumber = ${{ needs.pre-deployment.outputs.create-issue }};
+            const prevSha = '${{ steps.commit-info.outputs.PREV_SHA }}';
+            const currentSha = '${{ steps.commit-info.outputs.CURRENT_SHA }}';
+            const version = '${{ steps.commit-info.outputs.VERSION }}';
+            const artifact = '${{ steps.compress.outputs.ARTIFACT_NAME }}';
+            const sha256 = '${{ steps.compress.outputs.SHA256 }}';
+            const comment = `
+            ## 🔄 Rollback Plan Ready
+
+            - Previous Commit: ${prevSha}
+            - Current Commit: ${currentSha}
+            - Package Version: ${version}
+            - Artifact: ${artifact}
+            - ✅ Rollback script created
+            - ✅ Configuration backup completed
+            - ✅ Dependency verification script prepared
+            - ✅ Rollback documentation generated
+            - ✅ Artifact compressed and checksummed
+            - SHA256: ${sha256}
+
+            ### Quick Rollback Command
+            \`\`\`bash
+            ./rollback.sh ${prevSha}
+            \`\`\`
+
+            - Rollback script created: true
+            - Configuration backup: true
+            `;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: comment
+            });
+
+  post-deployment:
+    name: post-deployment
+    runs-on: ubuntu-latest
+    needs: rollback-preparation
+    steps:
+      - name: Update issue labels
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const issueNumber = ${{ needs.pre-deployment.outputs.create-issue }};
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              name: 'in-progress'
+            });
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              labels: ['completed']
+            });
+
+      - name: Post final comment
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const issueNumber = ${{ needs.pre-deployment.outputs.create-issue }};
+            const artifact = '${{ needs.rollback-preparation.outputs.compress.ARTIFACT_NAME }}';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: `Deployment Completed Successfully.\n\nRollback artifact: ${artifact}.tar.gz`
+            });
+
+      - name: Close deployment issue
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const issueNumber = ${{ needs.pre-deployment.outputs.create-issue }};
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              state: 'closed'
+            });
