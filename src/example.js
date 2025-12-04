@@ -1,2 +1,2 @@
-const unusedVariable = 42
-console.log("Hello World")
+const usedVariable = 42;
+console.log('Hello World');
